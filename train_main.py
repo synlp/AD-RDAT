@@ -20,7 +20,7 @@ from diacritization_stat import calculate_der, calculate_wer
 
 from optimization import BertAdam, warmup_linear
 from schedulers import LinearWarmUpScheduler, PolyWarmUpScheduler
-from apex import amp
+# from apex import amp
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -121,7 +121,7 @@ class Instructor:
         with open(output_config_file, "w", encoding='utf-8') as writer:
             writer.write(model_to_save.config.to_json_string())
         torch.save({'optimizer': optimizer.state_dict(),
-                    'master params': list(amp.master_params(optimizer))},
+                    'master params': optimizer},
                    output_optimizer_file)
         output_args_file = os.path.join(saving_model_path, 'training_args.bin')
         torch.save(self.args, output_args_file)
@@ -134,14 +134,8 @@ class Instructor:
         model.load_state_dict(checkpoint_model)
         #optimizer
         checkpoint_optimizer = torch.load(output_optimizer_file, map_location="cpu")
-        if self.args.fp16:
-            optimizer._lazy_init_maybe_master_weights()
-            optimizer._amp_stash.lazy_init_called = True
-            optimizer.load_state_dict(checkpoint_optimizer['optimizer'])
-            for param, saved_param in zip(amp.master_params(optimizer), checkpoint_optimizer['master params']):
-                param.data.copy_(saved_param.data)
-        else:
-            optimizer.load_state_dict(checkpoint_optimizer["optimizer"])
+
+        optimizer.load_state_dict(checkpoint_optimizer["optimizer"])
         return model, optimizer
 
     def save_args(self):
@@ -179,30 +173,18 @@ class Instructor:
             loss = loss / 2
             d_loss = d_loss / 2
             h_loss = h_loss / 2
-            if args.fp16:
-                if args.adversary is True:
-                    with amp.scale_loss(loss + d_loss + h_loss, optimizer) as scaled_loss:
-                        scaled_loss.backward()
-                else:
-                    with amp.scale_loss(loss, optimizer) as scaled_loss:
-                        scaled_loss.backward()
+            if args.adversary is True:
+                scaled_loss = loss + d_loss + h_loss
+                scaled_loss.backward()
             else:
-                if args.adversary is True:
-                    scaled_loss = loss + d_loss + h_loss
-                    scaled_loss.backward()
-                else:
-                    loss.backward()
+                loss.backward()
             tr_loss += loss.item()
             average_loss += loss
 
             if (i_batch + 1) % args.gradient_accumulation_steps == 0:
-                if args.fp16:
-                    torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), 1.0)
-                else:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
-                if args.fp16:
-                    scheduler.step()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
                 optimizer.step()
                 optimizer.zero_grad()
                 global_step += 1
@@ -213,12 +195,8 @@ class Instructor:
             if global_step % self.args.log_step == 0:
                 train_acc = n_correct / n_total
                 train_loss = loss_total / n_total
-                if args.fp16:
-                    logger.info('global_step: {}, loss: {:.4f}, acc: {:.4f} '
-                            'lr: {:.6f}'.format(global_step, train_loss, train_acc, scheduler.get_lr()[0]))
-                else:
-                    logger.info('global_step: {}, loss: {:.4f}, acc: {:.4f} '
-                                'lr: {:.6f}'.format(global_step, train_loss, train_acc, optimizer.get_lr()[0]))
+                logger.info('global_step: {}, loss: {:.4f}, acc: {:.4f} '
+                            'lr: {:.6f}'.format(global_step, train_loss, train_acc, optimizer.get_lr()[0]))
         return global_step
 
     def _train_single_criteria(self, model, optimizer, scheduler, train_data_loader, global_step, args):
@@ -240,21 +218,13 @@ class Instructor:
                                                      criteria_index=0)
             if args.gradient_accumulation_steps > 1:
                 loss = loss / args.gradient_accumulation_steps
-            if args.fp16:
-                with amp.scale_loss(loss, optimizer) as scaled_loss:
-                    scaled_loss.backward()
-            else:
-                loss.backward()
+            loss.backward()
             tr_loss += loss.item()
             average_loss += loss
             if (i_batch + 1) % args.gradient_accumulation_steps == 0:
-                if args.fp16:
-                    torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), 1.0)
-                else:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
-                if args.fp16:
-                    scheduler.step()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
                 optimizer.step()
                 optimizer.zero_grad()
                 global_step += 1
@@ -265,12 +235,8 @@ class Instructor:
             if global_step % self.args.log_step == 0:
                 train_acc = n_correct / n_total
                 train_loss = loss_total / n_total
-                if args.fp16:
-                    logger.info('global_step: {}, loss: {:.4f}, acc: {:.4f} '
-                                'lr: {:.6f}'.format(global_step, train_loss, train_acc, scheduler.get_lr()[0]))
-                else:
-                    logger.info('global_step: {}, loss: {:.4f}, acc: {:.4f} '
-                                'lr: {:.6f}'.format(global_step, train_loss, train_acc, optimizer.get_lr()[0]))
+                logger.info('global_step: {}, loss: {:.4f}, acc: {:.4f} '
+                            'lr: {:.6f}'.format(global_step, train_loss, train_acc, optimizer.get_lr()[0]))
         return global_step
 
     def _train(self, model, optimizer, scheduler, train_data_loader, farasa_data_loader, dev_dataloader):
@@ -438,34 +404,11 @@ class Instructor:
 
         print("Number of parameters:", sum(p[1].numel() for p in param_optimizer if p[1].requires_grad))
 
-        if self.args.fp16:
-            print("using fp16")
-            try:
-                from apex.optimizers import FusedAdam
-            except ImportError:
-                raise ImportError(
-                    "Please install apex from https://www.github.com/nvidia/apex to use distributed and fp16 training.")
-
-            optimizer = FusedAdam(optimizer_grouped_parameters,
-                                  lr=self.args.learning_rate,
-                                  bias_correction=False)
-
-            if self.args.loss_scale == 0:
-
-                model, optimizer = amp.initialize(model, optimizer, opt_level="O2", keep_batchnorm_fp32=False,
-                                                  loss_scale="dynamic")
-            else:
-                model, optimizer = amp.initialize(model, optimizer, opt_level="O2", keep_batchnorm_fp32=False,
-                                                  loss_scale=self.args.loss_scale)
-            scheduler = LinearWarmUpScheduler(optimizer, warmup=self.args.warmup_proportion,
-                                              total_steps=num_train_optimization_steps)
-        else:
-            print("using fp32")
-            optimizer = BertAdam(optimizer_grouped_parameters,
-                                 lr=self.args.learning_rate,
-                                 warmup=self.args.warmup_proportion,
-                                 t_total=num_train_optimization_steps)
-            scheduler = None
+        optimizer = BertAdam(optimizer_grouped_parameters,
+                             lr=self.args.learning_rate,
+                             warmup=self.args.warmup_proportion,
+                             t_total=num_train_optimization_steps)
+        scheduler = None
 
         if self.args.local_rank != -1:
             try:
@@ -482,14 +425,8 @@ class Instructor:
             print("resume from: {}".format(self.args.resume_model))
             output_optimizer_file = os.path.join(self.args.resume_model, "optimizer.pt")
             checkpoint_optimizer = torch.load(output_optimizer_file, map_location="cpu")
-            if self.args.fp16:
-                optimizer._lazy_init_maybe_master_weights()
-                optimizer._amp_stash.lazy_init_called = True
-                optimizer.load_state_dict(checkpoint_optimizer['optimizer'])
-                for param, saved_param in zip(amp.master_params(optimizer), checkpoint_optimizer['master params']):
-                    param.data.copy_(saved_param.data)
-            else:
-                optimizer.load_state_dict(checkpoint_optimizer["optimizer"])
+
+            optimizer.load_state_dict(checkpoint_optimizer["optimizer"])
 
         return model, optimizer, scheduler, train_data_loader, farasa_data_loader, dev_dataloader
 
@@ -533,7 +470,6 @@ def get_args():
     parser.add_argument('--multi_criteria', action='store_true', help="Using multi criteria")
     parser.add_argument('--adversary', action='store_true', help="Using adversary learning")
     parser.add_argument('--save', action='store_true', help="Whether to save model")
-    parser.add_argument('--fp16', action='store_true', help="Whether to use 16-bit float precision instead of 32-bit")
     parser.add_argument("--local_rank", type=int, default=-1, help="local_rank for distributed training on gpus")
     parser.add_argument("--rank", type=int, default=0, help="local_rank for distributed training on gpus")
     parser.add_argument("--world_size", type=int, default=1, help="local_rank for distributed training on gpus")
@@ -587,6 +523,9 @@ def main():
 
     args.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     args.n_gpu = torch.cuda.device_count()
+
+    if not os.path.exists(args.log):
+        os.makedirs(args.log)
 
     log_file = '{}/{}-{}.log'.format(args.log, args.dataset, strftime("%y%m%d-%H%M", localtime()))
     logger.addHandler(logging.FileHandler(log_file))
