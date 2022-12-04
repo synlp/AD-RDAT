@@ -17,7 +17,7 @@ Implementation of paper "[Improving Arabic Diacritization with Regularized Decod
 
 ## Requirements
 
-Our code works with `python 3.8` and requires the following packages: [apex](https://github.com/NVIDIA/apex), [pytorch](https://pytorch.org/).
+Our code works with `python 3.8` and requires the following packages: [sklearn](https://scikit-learn.org/stable/install.html), [pytorch](https://pytorch.org/).
 
 It also require the PyTorch version of pre-trained language models: [multi-lingual BERT](https://github.com/google-research/bert) and [AraBERT](https://github.com/aub-mind/arabert).
 
