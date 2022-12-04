@@ -1,0 +1,4 @@
+pytorch
+scikit-learn
+numpy
+apex
